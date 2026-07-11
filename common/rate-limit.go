@@ -41,6 +41,26 @@ func (l *InMemoryRateLimiter) clearExpiredItems() {
 	}
 }
 
+// Check performs a read-only sliding window check with the same logic as
+// Request but without recording the request. It returns true if a request to
+// key would be allowed. maxRequestNum == 0 means unlimited.
+func (l *InMemoryRateLimiter) Check(key string, maxRequestNum int, duration int64) bool {
+	if maxRequestNum == 0 {
+		return true
+	}
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	queue, ok := l.store[key]
+	if !ok {
+		return true
+	}
+	now := time.Now().Unix()
+	if len(*queue) < maxRequestNum {
+		return true
+	}
+	return now-(*queue)[0] >= duration
+}
+
 // Request parameter duration's unit is seconds
 func (l *InMemoryRateLimiter) Request(key string, maxRequestNum int, duration int64) bool {
 	l.mutex.Lock()
