@@ -2,13 +2,13 @@ package middleware
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/common/limiter"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/setting"
 
@@ -16,12 +16,42 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
+//go:embed lua/sliding_window_consume.lua
+var slidingWindowConsumeLua string
+
 const (
 	ModelRequestRateLimitCountMark             = "MRRL"
 	ModelRequestRateLimitSuccessCountMark      = "MRRLS"
 	ModelRequestRateLimitTokenCountMark        = "MRRLT"
 	ModelRequestRateLimitTokenSuccessCountMark = "MRRLTS"
+	// Count2/TokenCount2 marks use the atomic Lua sliding-window implementation
+	// and stay disjoint from the legacy LPUSH/LTRIM keys written by the
+	// non-atomic recordRedisRequest path.
+	ModelRequestRateLimitCount2Mark      = "MRRL2"
+	ModelRequestRateLimitTokenCount2Mark = "MRRLT2"
 )
+
+// slidingWindowConsume atomically records and checks a request against the
+// sliding-window limit in Redis. maxCount==0 means unlimited and bypasses
+// Redis entirely. duration is in seconds. Returns false only when the limit
+// is reached or Redis reports an error; the error is logged via
+// common.SysError before returning false.
+func slidingWindowConsume(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) bool {
+	if maxCount == 0 {
+		return true
+	}
+	now := time.Now().Unix()
+	result, err := redis.NewScript(slidingWindowConsumeLua).Run(
+		ctx, rdb,
+		[]string{key},
+		now, maxCount, duration,
+	).Int()
+	if err != nil {
+		common.SysError(fmt.Sprintf("slidingWindowConsume failed: %v", err))
+		return false
+	}
+	return result == 1
+}
 
 // checkRedisRateLimit checks whether a request would be allowed under the
 // sliding-window count limit, without recording it. maxCount==0 means
@@ -77,8 +107,8 @@ func recordRedisRequest(ctx context.Context, rdb *redis.Client, key string, maxC
 // redisRateLimitHandler enforces four thresholds:
 //   - userSuccess: user-aggregate successful-request cap (read-only check)
 //   - tokenSuccess: per-token successful-request cap (read-only check)
-//   - userTotal: user-aggregate total-request cap (atomic token-bucket consume)
-//   - tokenTotal: per-token total-request cap (atomic token-bucket consume)
+//   - userTotal: user-aggregate total-request cap (atomic sliding-window consume)
+//   - tokenTotal: per-token total-request cap (atomic sliding-window consume)
 //
 // duration is in seconds.
 func redisRateLimitHandler(duration int64, userTotal, userSuccess, tokenTotal, tokenSuccess int) gin.HandlerFunc {
@@ -118,45 +148,19 @@ func redisRateLimitHandler(duration int64, userTotal, userSuccess, tokenTotal, t
 			}
 		}
 
-		// 3. User total consume (atomic token bucket)
+		// 3. User total consume (atomic sliding window)
 		if userTotal > 0 {
-			userTotalKey := fmt.Sprintf("rateLimit:%s:%s", ModelRequestRateLimitCountMark, userId)
-			tb := limiter.New(ctx, rdb)
-			allowed, err := tb.Allow(
-				ctx,
-				userTotalKey,
-				limiter.WithCapacity(int64(userTotal)*duration),
-				limiter.WithRate(int64(userTotal)),
-				limiter.WithRequested(duration),
-			)
-			if err != nil {
-				fmt.Println("检查用户总请求数限制失败:", err.Error())
-				abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
-				return
-			}
-			if !allowed {
+			key := fmt.Sprintf("rateLimit:%s:%s", ModelRequestRateLimitCount2Mark, userId)
+			if !slidingWindowConsume(ctx, rdb, key, userTotal, duration) {
 				abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("您已达到总请求数限制：%d分钟内最多请求%d次，包括失败次数，请检查您的请求是否正确", setting.ModelRequestRateLimitDurationMinutes, userTotal))
 				return
 			}
 		}
 
-		// 4. Token total consume (atomic token bucket)
+		// 4. Token total consume (atomic sliding window)
 		if tokenTotal > 0 && c.GetInt("token_id") != 0 {
-			tokenTotalKey := fmt.Sprintf("rateLimit:%s:%s:%s", ModelRequestRateLimitTokenCountMark, userId, tokenId)
-			tb := limiter.New(ctx, rdb)
-			allowed, err := tb.Allow(
-				ctx,
-				tokenTotalKey,
-				limiter.WithCapacity(int64(tokenTotal)*duration),
-				limiter.WithRate(int64(tokenTotal)),
-				limiter.WithRequested(duration),
-			)
-			if err != nil {
-				fmt.Println("检查令牌总请求数限制失败:", err.Error())
-				abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
-				return
-			}
-			if !allowed {
+			key := fmt.Sprintf("rateLimit:%s:%s:%s", ModelRequestRateLimitTokenCount2Mark, userId, tokenId)
+			if !slidingWindowConsume(ctx, rdb, key, tokenTotal, duration) {
 				abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("该令牌的请求次数已达到上限：%d分钟内最多请求%d次，包括失败次数，请检查您的请求是否正确", setting.ModelRequestRateLimitDurationMinutes, tokenTotal))
 				return
 			}
