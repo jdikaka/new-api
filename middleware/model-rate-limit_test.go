@@ -1,15 +1,21 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/setting"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -242,4 +248,342 @@ func TestModelRateLimitTokenIdZeroSkipsPerTokenLayer(t *testing.T) {
 		"no per-token total key should exist for tokenId=0")
 	assert.True(t, inMemoryRateLimiter.Check(tokenSuccessKey, 1, duration),
 		"no per-token success key should exist for tokenId=0")
+}
+
+// TestSlidingWindowConsume exercises the atomic Lua sliding-window limiter
+// against an in-process miniredis. Verifies the three branches of the script:
+//   - under-capacity → allow (LPUSH + EXPIRE)
+//   - saturated, oldest within window → deny (EXPIRE refresh)
+//   - after window elapses → allow again (oldest evicted)
+//
+// Also checks the Go-side invariants: maxCount==0 bypasses Redis entirely,
+// and a saturated key still has a TTL set so it cannot leak past window+1.
+func TestSlidingWindowConsume(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer func() { _ = rdb.Close() }()
+
+	ctx := context.Background()
+	const maxCount = 3
+	const duration = int64(60)
+	key := "test:sliding"
+
+	// maxCount==0 must bypass Redis entirely (no keys created, no scripts run).
+	t.Run("maxCount zero bypasses Redis", func(t *testing.T) {
+		bypassKey := "test:bypass"
+		require.True(t, slidingWindowConsume(ctx, rdb, bypassKey, 0, duration))
+		assert.False(t, mr.Exists(bypassKey), "no key should be written when maxCount==0")
+	})
+
+	// 3 allows, 4th denied, then after FastForward(duration+1) the saturated
+	// key expires and the 5th call is allowed again.
+	t.Run("allow 3 then deny then allow after window", func(t *testing.T) {
+		for i := 0; i < maxCount; i++ {
+			require.True(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration),
+				"request %d under cap should be allowed", i+1)
+		}
+
+		// Saturated: oldest (tail) is within window → deny. EXPIRE must still be set.
+		require.False(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration),
+			"4th request over cap should be denied")
+
+		ttl := mr.TTL(key)
+		assert.True(t, ttl > 0 && ttl <= time.Duration(duration+1)*time.Second,
+			"deny branch must set EXPIRE in (0, duration+1], got %v", ttl)
+
+		// Advance miniredis clock past window. The saturated key expires, so the
+		// next call sees LLEN=0 and re-enters the under-capacity allow branch.
+		mr.FastForward(time.Duration(duration+1) * time.Second)
+		require.True(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration),
+			"request after window elapsed should be allowed")
+	})
+}
+
+// newMiniRedisLimiter starts an in-process miniredis server, wires common.RDB
+// to it, sets common.RedisEnabled=true, and registers cleanup. Call AFTER
+// withRateLimitSettings — the RedisEnabled=true override needs to win, and
+// cleanup runs LIFO so the original value is still restored correctly.
+// Returns the miniredis handle so callers can FastForward / inspect keys.
+func newMiniRedisLimiter(t *testing.T) *miniredis.Miniredis {
+	t.Helper()
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+
+	prevRDB := common.RDB
+	prevRedis := common.RedisEnabled
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	common.RDB = rdb
+	common.RedisEnabled = true
+
+	t.Cleanup(func() {
+		_ = rdb.Close()
+		mr.Close()
+		common.RDB = prevRDB
+		common.RedisEnabled = prevRedis
+	})
+
+	return mr
+}
+
+// Redis mirror of TestModelRateLimitTokenIndependence. Per-token counters
+// stored in Redis must be independent across tokens under the same user.
+func TestRedisRateLimitTokenIndependence(t *testing.T) {
+	withRateLimitSettings(t, 1, 100, 0, map[string][2]int{"test": {2, 0}})
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	router := buildRateLimitRouter(t, 1001, 101, "test", okJSONHandler())
+
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+	require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(router).Code,
+		"3rd request for token 101 should be blocked by per-token total limit")
+
+	router2 := buildRateLimitRouter(t, 1001, 102, "test", okJSONHandler())
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router2).Code,
+		"token 102 has its own independent counter and should pass")
+}
+
+// Redis mirror of TestModelRateLimitUserAggregateCeiling. The user-aggregate
+// MRRL2 counter bounds the sum across all of the user's tokens.
+func TestRedisRateLimitUserAggregateCeiling(t *testing.T) {
+	withRateLimitSettings(t, 1, 4, 0, map[string][2]int{"test": {100, 0}})
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	r201 := buildRateLimitRouter(t, 1002, 201, "test", okJSONHandler())
+	r202 := buildRateLimitRouter(t, 1002, 202, "test", okJSONHandler())
+
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(r201).Code)
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(r201).Code)
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(r202).Code)
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(r202).Code)
+
+	require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(r201).Code,
+		"5th request should be blocked by user-aggregate total ceiling")
+}
+
+// Redis mirror of TestModelRateLimitGroupThresholdOverride. Group config
+// overrides per-token thresholds; without group config the global default
+// is used.
+func TestRedisRateLimitGroupThresholdOverride(t *testing.T) {
+	t.Run("group override sets per-token total", func(t *testing.T) {
+		withRateLimitSettings(t, 1, 2, 0, map[string][2]int{"vip": {5, 0}})
+		mr := newMiniRedisLimiter(t)
+		_ = mr
+
+		router := buildRateLimitRouter(t, 1003, 301, "vip", okJSONHandler())
+
+		require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+		require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+		require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(router).Code,
+			"3rd request blocked by user-aggregate total (2/2), not by token layer (2/5)")
+	})
+
+	t.Run("no group falls back to global", func(t *testing.T) {
+		withRateLimitSettings(t, 1, 100, 0, nil)
+		mr := newMiniRedisLimiter(t)
+		_ = mr
+
+		router := buildRateLimitRouter(t, 1004, 302, "", okJSONHandler())
+
+		for i := 0; i < 3; i++ {
+			require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code,
+				"request %d should pass with tokenTotal=100 (global fallback)", i+1)
+		}
+	})
+}
+
+// Redis mirror of TestModelRateLimitMissingReturnBugFixed. When the limit is
+// hit, c.Next() must NOT be invoked — the Redis handler must `return` after
+// abort, not fall through.
+func TestRedisRateLimitMissingReturnBugFixed(t *testing.T) {
+	withRateLimitSettings(t, 1, 1, 0, nil)
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	downstreamCalled := false
+	router := buildRateLimitRouter(t, 1005, 501, "", func(c *gin.Context) {
+		downstreamCalled = true
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+	require.True(t, downstreamCalled, "downstream should be called for 1st request")
+
+	downstreamCalled = false
+	rec := fireRateLimitRequest(router)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	assert.False(t, downstreamCalled, "downstream must NOT be called when rate limit blocks")
+}
+
+// Redis mirror of TestModelRateLimitCheckIsReadOnly. A failed request (status
+// >= 400) must not consume the success counter — Check() is read-only, only
+// recordRedisRequest after a 2xx increments.
+func TestRedisRateLimitCheckIsReadOnly(t *testing.T) {
+	withRateLimitSettings(t, 1, 100, 2, nil)
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	callCount := 0
+	router := buildRateLimitRouter(t, 1006, 601, "", func(c *gin.Context) {
+		callCount++
+		if callCount == 2 {
+			c.JSON(http.StatusInternalServerError, gin.H{"err": "simulated"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+	require.Equal(t, http.StatusInternalServerError, fireRateLimitRequest(router).Code)
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code,
+		"3rd request must pass — Check() is read-only, failure didn't consume success counter")
+	require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(router).Code,
+		"4th request blocked by success counter (2/2)")
+
+	// Verify token success counter reached 2 in Redis (LLen of MRRLTS list).
+	ctx := context.Background()
+	tokenSuccessKey := "rateLimit:" + ModelRequestRateLimitTokenSuccessCountMark + ":1006:601"
+	length, err := common.RDB.LLen(ctx, tokenSuccessKey).Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), length,
+		"token success list should hold 2 entries after 2 successful requests")
+}
+
+// Redis mirror of TestModelRateLimitTokenIdZeroSkipsPerTokenLayer. When
+// token_id=0, the per-token layer is skipped entirely — no MRRLT2/MRRLTS
+// keys should be written.
+func TestRedisRateLimitTokenIdZeroSkipsPerTokenLayer(t *testing.T) {
+	withRateLimitSettings(t, 1, 100, 0, map[string][2]int{"test": {5, 0}})
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	router := buildRateLimitRouter(t, 1007, 0, "test", okJSONHandler())
+
+	for i := 0; i < 6; i++ {
+		require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code,
+			"request %d should pass — per-token layer skipped when tokenId=0", i+1)
+	}
+
+	assert.False(t, mr.Exists("rateLimit:"+ModelRequestRateLimitTokenCount2Mark+":1007:0"),
+		"no per-token total key should exist for tokenId=0")
+	assert.False(t, mr.Exists("rateLimit:"+ModelRequestRateLimitTokenSuccessCountMark+":1007:0"),
+		"no per-token success key should exist for tokenId=0")
+}
+
+// TestRedisRateLimitConcurrencyAtomicity verifies the atomic Lua script
+// serializes concurrent consumers correctly: with maxCount=5, exactly 5 of
+// 100 concurrent requests must succeed. The Lua script runs atomically under
+// Redis's single-threaded evaluation, so there is no TOCTOU window between
+// LLEN and LPUSH.
+func TestRedisRateLimitConcurrencyAtomicity(t *testing.T) {
+	withRateLimitSettings(t, 1, 5, 0, nil)
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	router := buildRateLimitRouter(t, 2001, 701, "", okJSONHandler())
+
+	var successCount int64
+	var wg sync.WaitGroup
+	const goroutines = 100
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			rec := fireRateLimitRequest(router)
+			if rec.Code == http.StatusOK {
+				atomic.AddInt64(&successCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(5), successCount,
+		"exactly maxCount=5 requests should succeed under concurrent load (atomic Lua)")
+}
+
+// TestRedisRateLimitNoscriptResilience verifies that a SCRIPT FLUSH between
+// requests does not surface as HTTP 500. go-redis's NewScript.Run retries
+// EVAL transparently on NOSCRIPT; even in the degenerate case,
+// slidingWindowConsume fail-closes to "deny" (429), never 500.
+func TestRedisRateLimitNoscriptResilience(t *testing.T) {
+	withRateLimitSettings(t, 1, 100, 0, nil)
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	router := buildRateLimitRouter(t, 2002, 702, "", okJSONHandler())
+
+	// Prime the script cache with one request.
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+
+	// Flush all loaded scripts — next EVALSHA will return NOSCRIPT.
+	ctx := context.Background()
+	require.NoError(t, common.RDB.ScriptFlush(ctx).Err(),
+		"miniredis must accept SCRIPT FLUSH")
+
+	// The next request must NOT surface as HTTP 500. go-redis retries EVAL
+	// transparently after NOSCRIPT, so this should be 200 (still under cap).
+	rec := fireRateLimitRequest(router)
+	assert.NotEqual(t, http.StatusInternalServerError, rec.Code,
+		"NOSCRIPT must be handled transparently — no HTTP 500")
+}
+
+// TestRedisRateLimitExpireOnDeny verifies that a saturated key still has
+// EXPIRE set by the deny branch (Lua line 35), so it cannot outlive the
+// window. After FastForward(duration+2) the key must be gone from Redis.
+func TestRedisRateLimitExpireOnDeny(t *testing.T) {
+	const durationMinutes = 1
+	withRateLimitSettings(t, durationMinutes, 2, 0, nil)
+	mr := newMiniRedisLimiter(t)
+
+	router := buildRateLimitRouter(t, 2003, 703, "", okJSONHandler())
+
+	// Fill to max.
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
+
+	// Deny a few — deny branch must still set EXPIRE.
+	require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(router).Code)
+	require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(router).Code)
+
+	userKey := "rateLimit:" + ModelRequestRateLimitCount2Mark + ":2003"
+	require.True(t, mr.Exists(userKey),
+		"saturated key should exist immediately after denies")
+
+	// TTL must be positive and bounded by duration+1 (the Lua deny branch
+	// sets EXPIRE to duration+1).
+	ttl := mr.TTL(userKey)
+	require.True(t, ttl > 0 && ttl <= time.Duration(durationMinutes*60+1)*time.Second,
+		"deny branch should set EXPIRE in (0, duration+1], got %v", ttl)
+
+	// Advance miniredis clock past the window — key must expire.
+	duration := int64(durationMinutes * 60)
+	mr.FastForward(time.Duration(duration+2) * time.Second)
+	assert.False(t, mr.Exists(userKey),
+		"saturated key must be gone after FastForward(duration+2) — EXPIRE-on-deny prevents leaks")
+}
+
+// TestRedisRateLimitMaxCountZeroUnlimited verifies that maxCount=0 means
+// unlimited: 100 requests all pass and no MRRL2 keys are written. The Go
+// wrapper short-circuits before touching Redis when maxCount==0.
+func TestRedisRateLimitMaxCountZeroUnlimited(t *testing.T) {
+	withRateLimitSettings(t, 1, 0, 0, nil)
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	router := buildRateLimitRouter(t, 2004, 704, "", okJSONHandler())
+
+	for i := 0; i < 100; i++ {
+		require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code,
+			"request %d should pass with maxCount=0 (unlimited)", i+1)
+	}
+
+	matches, err := common.RDB.Keys(context.Background(), "rateLimit:"+ModelRequestRateLimitCount2Mark+":*").Result()
+	require.NoError(t, err)
+	assert.Empty(t, matches, "no MRRL2 keys should exist when maxCount=0")
 }
