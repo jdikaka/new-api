@@ -184,11 +184,11 @@ func TestModelRateLimitMissingReturnBugFixed(t *testing.T) {
 	assert.False(t, downstreamCalled, "downstream must NOT be called when rate limit blocks")
 }
 
-// Test 5: Check() is read-only — a failed request does not consume the
-// success counter. This proves the _check hack (which used Request() and
-// consumed on every check) is gone. Both user and token success counters
-// follow the same behavior.
-func TestModelRateLimitCheckIsReadOnly(t *testing.T) {
+// Test 5: a failed request does not consume the success counter. The success
+// counter is reserved atomically up front and refunded when the response is a
+// failure (HTTP >= 400), so the 500 below leaves the counter where it was.
+// Both user and token success counters follow the same behavior.
+func TestModelRateLimitFailedRequestDoesNotConsumeSuccess(t *testing.T) {
 	withRateLimitSettings(t, 1, 100, 2, nil)
 
 	callCount := 0
@@ -204,20 +204,20 @@ func TestModelRateLimitCheckIsReadOnly(t *testing.T) {
 	// Request 1 (200): success counters increment to 1.
 	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
 
-	// Request 2 (500): success counters do NOT increment (still 1).
+	// Request 2 (500): refunded — success counters stay at 1.
 	require.Equal(t, http.StatusInternalServerError, fireRateLimitRequest(router).Code)
 
-	// Request 3 (200): passes because Check() is read-only — the failure did
-	// not consume the success counter. With the old _check hack, the check
-	// counter would be at 2 and this request would be blocked.
+	// Request 3 (200): passes because the failed request was refunded, so the
+	// success counter still had room (1/2 → 2/2).
 	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code,
-		"3rd request must pass — Check() is read-only, failure didn't consume success counter")
+		"3rd request must pass — the 500 was refunded and did not consume the success counter")
 
 	// Request 4 (200): blocked — success counter now at 2 (from requests 1 and 3).
 	require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(router).Code,
 		"4th request blocked by success counter (2/2)")
 
 	// Verify token success counter also reached 2 (same behavior as user success).
+	// Check() here is used only as a read-only probe of the limiter's state.
 	duration := int64(setting.ModelRequestRateLimitDurationMinutes * 60)
 	tokenSuccessKey := ModelRequestRateLimitTokenSuccessCountMark + "1006:601"
 	assert.False(t, inMemoryRateLimiter.Check(tokenSuccessKey, 2, duration),
@@ -269,12 +269,16 @@ func TestSlidingWindowConsume(t *testing.T) {
 	ctx := context.Background()
 	const maxCount = 3
 	const duration = int64(60)
+	// Fixed caller-supplied timestamp. The allow-after-window case below is
+	// exercised by the key expiring under FastForward, not by advancing now, so
+	// a constant keeps the test deterministic and free of wall-clock drift.
+	const now = int64(1700000000)
 	key := "test:sliding"
 
 	// maxCount==0 must bypass Redis entirely (no keys created, no scripts run).
 	t.Run("maxCount zero bypasses Redis", func(t *testing.T) {
 		bypassKey := "test:bypass"
-		require.True(t, slidingWindowConsume(ctx, rdb, bypassKey, 0, duration))
+		require.True(t, slidingWindowConsume(ctx, rdb, bypassKey, 0, duration, now))
 		assert.False(t, mr.Exists(bypassKey), "no key should be written when maxCount==0")
 	})
 
@@ -282,12 +286,12 @@ func TestSlidingWindowConsume(t *testing.T) {
 	// key expires and the 5th call is allowed again.
 	t.Run("allow 3 then deny then allow after window", func(t *testing.T) {
 		for i := 0; i < maxCount; i++ {
-			require.True(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration),
+			require.True(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration, now),
 				"request %d under cap should be allowed", i+1)
 		}
 
 		// Saturated: oldest (tail) is within window → deny. EXPIRE must still be set.
-		require.False(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration),
+		require.False(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration, now),
 			"4th request over cap should be denied")
 
 		ttl := mr.TTL(key)
@@ -297,7 +301,7 @@ func TestSlidingWindowConsume(t *testing.T) {
 		// Advance miniredis clock past window. The saturated key expires, so the
 		// next call sees LLEN=0 and re-enters the under-capacity allow branch.
 		mr.FastForward(time.Duration(duration+1) * time.Second)
-		require.True(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration),
+		require.True(t, slidingWindowConsume(ctx, rdb, key, maxCount, duration, now),
 			"request after window elapsed should be allowed")
 	})
 }
@@ -421,10 +425,11 @@ func TestRedisRateLimitMissingReturnBugFixed(t *testing.T) {
 	assert.False(t, downstreamCalled, "downstream must NOT be called when rate limit blocks")
 }
 
-// Redis mirror of TestModelRateLimitCheckIsReadOnly. A failed request (status
-// >= 400) must not consume the success counter — Check() is read-only, only
-// recordRedisRequest after a 2xx increments.
-func TestRedisRateLimitCheckIsReadOnly(t *testing.T) {
+// Redis mirror of TestModelRateLimitFailedRequestDoesNotConsumeSuccess. A
+// failed request (status >= 400) must be refunded: the success slot reserved
+// up front is released, so only successful responses leave an entry in the
+// success list.
+func TestRedisRateLimitFailedRequestDoesNotConsumeSuccess(t *testing.T) {
 	withRateLimitSettings(t, 1, 100, 2, nil)
 	mr := newMiniRedisLimiter(t)
 	_ = mr
@@ -442,17 +447,17 @@ func TestRedisRateLimitCheckIsReadOnly(t *testing.T) {
 	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code)
 	require.Equal(t, http.StatusInternalServerError, fireRateLimitRequest(router).Code)
 	require.Equal(t, http.StatusOK, fireRateLimitRequest(router).Code,
-		"3rd request must pass — Check() is read-only, failure didn't consume success counter")
+		"3rd request must pass — the 500 was refunded and did not consume the success counter")
 	require.Equal(t, http.StatusTooManyRequests, fireRateLimitRequest(router).Code,
 		"4th request blocked by success counter (2/2)")
 
-	// Verify token success counter reached 2 in Redis (LLen of MRRLTS list).
+	// Verify token success counter reached 2 in Redis (LLen of MRRLTS2 list).
 	ctx := context.Background()
-	tokenSuccessKey := "rateLimit:" + ModelRequestRateLimitTokenSuccessCountMark + ":1006:601"
+	tokenSuccessKey := "rateLimit:" + ModelRequestRateLimitTokenSuccessCount2Mark + ":1006:601"
 	length, err := common.RDB.LLen(ctx, tokenSuccessKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), length,
-		"token success list should hold 2 entries after 2 successful requests")
+		"token success list should hold 2 entries after 2 successful requests (the 500 was refunded)")
 }
 
 // Redis mirror of TestModelRateLimitTokenIdZeroSkipsPerTokenLayer. When
@@ -472,7 +477,7 @@ func TestRedisRateLimitTokenIdZeroSkipsPerTokenLayer(t *testing.T) {
 
 	assert.False(t, mr.Exists("rateLimit:"+ModelRequestRateLimitTokenCount2Mark+":1007:0"),
 		"no per-token total key should exist for tokenId=0")
-	assert.False(t, mr.Exists("rateLimit:"+ModelRequestRateLimitTokenSuccessCountMark+":1007:0"),
+	assert.False(t, mr.Exists("rateLimit:"+ModelRequestRateLimitTokenSuccessCount2Mark+":1007:0"),
 		"no per-token success key should exist for tokenId=0")
 }
 
@@ -505,6 +510,39 @@ func TestRedisRateLimitConcurrencyAtomicity(t *testing.T) {
 
 	require.Equal(t, int64(5), successCount,
 		"exactly maxCount=5 requests should succeed under concurrent load (atomic Lua)")
+}
+
+// TestRedisRateLimitSuccessCounterAtomicity is the regression test for the
+// success-counter TOCTOU. With a success cap of 5 and a total cap that never
+// binds, exactly 5 of 100 concurrent successful requests must pass. The old
+// read-only-check-then-record design let a concurrent burst all pass the check
+// before any of them recorded, blowing past the cap; reserving the slot
+// atomically up front (refunded on failure) removes that window.
+func TestRedisRateLimitSuccessCounterAtomicity(t *testing.T) {
+	// total=1000 never binds across 100 requests; success=5 is the only gate.
+	withRateLimitSettings(t, 1, 1000, 5, nil)
+	mr := newMiniRedisLimiter(t)
+	_ = mr
+
+	router := buildRateLimitRouter(t, 2005, 705, "", okJSONHandler())
+
+	var successCount int64
+	var wg sync.WaitGroup
+	const goroutines = 100
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			rec := fireRateLimitRequest(router)
+			if rec.Code == http.StatusOK {
+				atomic.AddInt64(&successCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(5), successCount,
+		"exactly successCount=5 requests should pass the success cap under concurrent load (atomic reserve + refund)")
 }
 
 // TestRedisRateLimitNoscriptResilience verifies that a SCRIPT FLUSH between

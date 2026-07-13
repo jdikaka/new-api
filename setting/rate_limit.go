@@ -56,11 +56,16 @@ func CheckModelRequestRateLimitGroup(jsonStr string) error {
 		return err
 	}
 	for group, limits := range checkModelRequestRateLimitGroup {
-		if limits[0] < 0 || limits[1] < 1 {
-			return fmt.Errorf("group %s has negative rate limit values: [%d, %d]", group, limits[0], limits[1])
+		// limits[0] is the total count (0 means unlimited, so >= 0 is valid);
+		// limits[1] is the success count and must be at least 1.
+		if limits[0] < 0 {
+			return fmt.Errorf("group %s total count must be >= 0, got %d", group, limits[0])
+		}
+		if limits[1] < 1 {
+			return fmt.Errorf("group %s success count must be >= 1, got %d", group, limits[1])
 		}
 		if limits[0] > math.MaxInt32 || limits[1] > math.MaxInt32 {
-			return fmt.Errorf("group %s [%d, %d] has max rate limits value 2147483647", group, limits[0], limits[1])
+			return fmt.Errorf("group %s rate limit [%d, %d] exceeds maximum value %d", group, limits[0], limits[1], math.MaxInt32)
 		}
 	}
 

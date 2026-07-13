@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/setting"
 
 	"github.com/gin-gonic/gin"
@@ -24,23 +25,26 @@ const (
 	ModelRequestRateLimitSuccessCountMark      = "MRRLS"
 	ModelRequestRateLimitTokenCountMark        = "MRRLT"
 	ModelRequestRateLimitTokenSuccessCountMark = "MRRLTS"
-	// Count2/TokenCount2 marks use the atomic Lua sliding-window implementation
-	// and stay disjoint from the legacy LPUSH/LTRIM keys written by the
-	// non-atomic recordRedisRequest path.
-	ModelRequestRateLimitCount2Mark      = "MRRL2"
-	ModelRequestRateLimitTokenCount2Mark = "MRRLT2"
+	// The *2 marks back the atomic Lua sliding-window counters. They stay
+	// disjoint from the in-memory (non-2) marks used by the memory path, so a
+	// deploy can never mix the Lua int-list format with stale string-list keys
+	// in the same Redis key.
+	ModelRequestRateLimitCount2Mark             = "MRRL2"
+	ModelRequestRateLimitTokenCount2Mark        = "MRRLT2"
+	ModelRequestRateLimitSuccessCount2Mark      = "MRRLS2"
+	ModelRequestRateLimitTokenSuccessCount2Mark = "MRRLTS2"
 )
 
 // slidingWindowConsume atomically records and checks a request against the
 // sliding-window limit in Redis. maxCount==0 means unlimited and bypasses
-// Redis entirely. duration is in seconds. Returns false only when the limit
-// is reached or Redis reports an error; the error is logged via
-// common.SysError before returning false.
-func slidingWindowConsume(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) bool {
+// Redis entirely. duration and now are in seconds; now is caller-supplied so
+// the caller can refund the exact entry it recorded (see slidingWindowRefund).
+// Returns false when the limit is reached or Redis reports an error; the error
+// is logged via common.SysError before returning false (fail-closed).
+func slidingWindowConsume(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration, now int64) bool {
 	if maxCount == 0 {
 		return true
 	}
-	now := time.Now().Unix()
 	result, err := redis.NewScript(slidingWindowConsumeLua).Run(
 		ctx, rdb,
 		[]string{key},
@@ -53,133 +57,97 @@ func slidingWindowConsume(ctx context.Context, rdb *redis.Client, key string, ma
 	return result == 1
 }
 
-// checkRedisRateLimit checks whether a request would be allowed under the
-// sliding-window count limit, without recording it. maxCount==0 means
-// unlimited. duration is in seconds.
-func checkRedisRateLimit(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) (bool, error) {
-	if maxCount == 0 {
-		return true, nil
+// slidingWindowRefund removes one occurrence of the timestamp that
+// slidingWindowConsume recorded for key, releasing a reserved slot. It rolls
+// back a success-counter reservation when the owning request fails (HTTP >=
+// 400) or is denied by a later guard. now must match the value passed to
+// slidingWindowConsume. The op is a no-op when the entry has already aged out
+// (the limiter then stays slightly stricter, never too lax).
+func slidingWindowRefund(ctx context.Context, rdb *redis.Client, key string, now int64) {
+	if err := rdb.LRem(ctx, key, 1, now).Err(); err != nil {
+		common.SysError(fmt.Sprintf("slidingWindowRefund failed: %v", err))
 	}
-
-	length, err := rdb.LLen(ctx, key).Result()
-	if err != nil {
-		return false, err
-	}
-
-	if length < int64(maxCount) {
-		return true, nil
-	}
-
-	oldTimeStr, _ := rdb.LIndex(ctx, key, -1).Result()
-	oldTime, err := time.Parse(timeFormat, oldTimeStr)
-	if err != nil {
-		return false, err
-	}
-
-	nowTimeStr := time.Now().Format(timeFormat)
-	nowTime, err := time.Parse(timeFormat, nowTimeStr)
-	if err != nil {
-		return false, err
-	}
-
-	subTime := nowTime.Sub(oldTime).Seconds()
-	if int64(subTime) < duration {
-		rdb.Expire(ctx, key, time.Duration(duration)*time.Second)
-		return false, nil
-	}
-
-	return true, nil
 }
 
-// recordRedisRequest pushes a timestamp onto the counter list and trims it to
-// maxCount entries. maxCount==0 is a no-op. duration is in seconds.
-func recordRedisRequest(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) {
-	if maxCount == 0 {
-		return
-	}
-
-	now := time.Now().Format(timeFormat)
-	rdb.LPush(ctx, key, now)
-	rdb.LTrim(ctx, key, 0, int64(maxCount-1))
-	rdb.Expire(ctx, key, time.Duration(duration)*time.Second)
+// rateLimitMsg translates a rate-limit message for the current request, filling
+// in the window length (minutes) and the threshold that was hit.
+func rateLimitMsg(c *gin.Context, key string, max int) string {
+	return common.TranslateMessage(c, key, map[string]any{
+		"Minutes": setting.ModelRequestRateLimitDurationMinutes,
+		"Max":     max,
+	})
 }
 
-// redisRateLimitHandler enforces four thresholds:
-//   - userSuccess: user-aggregate successful-request cap (read-only check)
-//   - tokenSuccess: per-token successful-request cap (read-only check)
-//   - userTotal: user-aggregate total-request cap (atomic sliding-window consume)
-//   - tokenTotal: per-token total-request cap (atomic sliding-window consume)
-//
-// duration is in seconds.
+// redisRateLimitHandler enforces four thresholds. The success counters
+// (userSuccess, tokenSuccess) are reserved atomically up front and refunded if
+// the request ends up denied or fails (any HTTP >= 400, including the 429s
+// raised by later guards). The total counters (userTotal, tokenTotal) are
+// consumed up front and never refunded — failed requests count toward the
+// total. Reserving success atomically (rather than a read-only check before
+// and a record after) closes the TOCTOU window that let a concurrent burst
+// slip past the success cap. duration is in seconds.
 func redisRateLimitHandler(duration int64, userTotal, userSuccess, tokenTotal, tokenSuccess int) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userId := strconv.Itoa(c.GetInt("id"))
 		tokenId := strconv.Itoa(c.GetInt("token_id"))
 		ctx := context.Background()
 		rdb := common.RDB
+		now := time.Now().Unix()
 
-		// 1. User success check (read-only)
+		// Success slots reserved below; refunded once if the final response is
+		// a failure. Reading status in the defer covers every deny path (a
+		// later guard's 429) and downstream failures uniformly.
+		var reserved []string
+		defer func() {
+			if c.Writer.Status() < http.StatusBadRequest {
+				return
+			}
+			for _, key := range reserved {
+				slidingWindowRefund(ctx, rdb, key, now)
+			}
+		}()
+
+		// 1. Reserve user success slot (atomic).
 		if userSuccess > 0 {
-			successKey := fmt.Sprintf("rateLimit:%s:%s", ModelRequestRateLimitSuccessCountMark, userId)
-			allowed, err := checkRedisRateLimit(ctx, rdb, successKey, userSuccess, duration)
-			if err != nil {
-				fmt.Println("检查用户成功请求数限制失败:", err.Error())
-				abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
+			key := fmt.Sprintf("rateLimit:%s:%s", ModelRequestRateLimitSuccessCount2Mark, userId)
+			if !slidingWindowConsume(ctx, rdb, key, userSuccess, duration, now) {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitReached, userSuccess))
 				return
 			}
-			if !allowed {
-				abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("您已达到请求数限制：%d分钟内最多请求%d次", setting.ModelRequestRateLimitDurationMinutes, userSuccess))
-				return
-			}
+			reserved = append(reserved, key)
 		}
 
-		// 2. Token success check (read-only)
+		// 2. Reserve token success slot (atomic).
 		if tokenSuccess > 0 && c.GetInt("token_id") != 0 {
-			tokenSuccessKey := fmt.Sprintf("rateLimit:%s:%s:%s", ModelRequestRateLimitTokenSuccessCountMark, userId, tokenId)
-			allowed, err := checkRedisRateLimit(ctx, rdb, tokenSuccessKey, tokenSuccess, duration)
-			if err != nil {
-				fmt.Println("检查令牌成功请求数限制失败:", err.Error())
-				abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
+			key := fmt.Sprintf("rateLimit:%s:%s:%s", ModelRequestRateLimitTokenSuccessCount2Mark, userId, tokenId)
+			if !slidingWindowConsume(ctx, rdb, key, tokenSuccess, duration, now) {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitTokenReached, tokenSuccess))
 				return
 			}
-			if !allowed {
-				abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("该令牌的成功请求次数已达到上限：%d分钟内最多请求%d次", setting.ModelRequestRateLimitDurationMinutes, tokenSuccess))
-				return
-			}
+			reserved = append(reserved, key)
 		}
 
-		// 3. User total consume (atomic sliding window)
+		// 3. Consume user total (atomic, non-refundable).
 		if userTotal > 0 {
 			key := fmt.Sprintf("rateLimit:%s:%s", ModelRequestRateLimitCount2Mark, userId)
-			if !slidingWindowConsume(ctx, rdb, key, userTotal, duration) {
-				abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("您已达到总请求数限制：%d分钟内最多请求%d次，包括失败次数，请检查您的请求是否正确", setting.ModelRequestRateLimitDurationMinutes, userTotal))
+			if !slidingWindowConsume(ctx, rdb, key, userTotal, duration, now) {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitTotalReached, userTotal))
 				return
 			}
 		}
 
-		// 4. Token total consume (atomic sliding window)
+		// 4. Consume token total (atomic, non-refundable).
 		if tokenTotal > 0 && c.GetInt("token_id") != 0 {
 			key := fmt.Sprintf("rateLimit:%s:%s:%s", ModelRequestRateLimitTokenCount2Mark, userId, tokenId)
-			if !slidingWindowConsume(ctx, rdb, key, tokenTotal, duration) {
-				abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("该令牌的请求次数已达到上限：%d分钟内最多请求%d次，包括失败次数，请检查您的请求是否正确", setting.ModelRequestRateLimitDurationMinutes, tokenTotal))
+			if !slidingWindowConsume(ctx, rdb, key, tokenTotal, duration, now) {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitTokenTotalReached, tokenTotal))
 				return
 			}
 		}
 
-		// 5. Process request
+		// 5. Process request. A failed response (>= 400) triggers the deferred
+		// refund above, releasing the reserved success slots.
 		c.Next()
-
-		// 6. Record success counters
-		if c.Writer.Status() < 400 {
-			if userSuccess > 0 {
-				successKey := fmt.Sprintf("rateLimit:%s:%s", ModelRequestRateLimitSuccessCountMark, userId)
-				recordRedisRequest(ctx, rdb, successKey, userSuccess, duration)
-			}
-			if tokenSuccess > 0 && c.GetInt("token_id") != 0 {
-				tokenSuccessKey := fmt.Sprintf("rateLimit:%s:%s:%s", ModelRequestRateLimitTokenSuccessCountMark, userId, tokenId)
-				recordRedisRequest(ctx, rdb, tokenSuccessKey, tokenSuccess, duration)
-			}
-		}
 	}
 }
 
@@ -191,52 +159,56 @@ func memoryRateLimitHandler(duration int64, userTotal, userSuccess, tokenTotal, 
 	return func(c *gin.Context) {
 		userId := strconv.Itoa(c.GetInt("id"))
 		tokenId := strconv.Itoa(c.GetInt("token_id"))
+		now := time.Now().Unix()
 
 		userTotalKey := ModelRequestRateLimitCountMark + userId
 		userSuccessKey := ModelRequestRateLimitSuccessCountMark + userId
 		tokenTotalKey := ModelRequestRateLimitTokenCountMark + userId + ":" + tokenId
 		tokenSuccessKey := ModelRequestRateLimitTokenSuccessCountMark + userId + ":" + tokenId
 
-		// 1. User success check (read-only)
-		if userSuccess > 0 && !inMemoryRateLimiter.Check(userSuccessKey, userSuccess, duration) {
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
+		var reserved []string
+		defer func() {
+			if c.Writer.Status() < http.StatusBadRequest {
+				return
+			}
+			for _, key := range reserved {
+				inMemoryRateLimiter.Cancel(key, now)
+			}
+		}()
+
+		// 1. Reserve user success slot (atomic).
+		if userSuccess > 0 {
+			if !inMemoryRateLimiter.RequestAt(userSuccessKey, userSuccess, duration, now) {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitReached, userSuccess))
+				return
+			}
+			reserved = append(reserved, userSuccessKey)
+		}
+
+		// 2. Reserve token success slot (atomic).
+		if tokenSuccess > 0 && tokenId != "0" {
+			if !inMemoryRateLimiter.RequestAt(tokenSuccessKey, tokenSuccess, duration, now) {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitTokenReached, tokenSuccess))
+				return
+			}
+			reserved = append(reserved, tokenSuccessKey)
+		}
+
+		// 3. Consume user total (atomic, non-refundable).
+		if userTotal > 0 && !inMemoryRateLimiter.RequestAt(userTotalKey, userTotal, duration, now) {
+			abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitTotalReached, userTotal))
 			return
 		}
 
-		// 2. Token success check (read-only)
-		if tokenSuccess > 0 && tokenId != "0" && !inMemoryRateLimiter.Check(tokenSuccessKey, tokenSuccess, duration) {
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
+		// 4. Consume token total (atomic, non-refundable).
+		if tokenTotal > 0 && tokenId != "0" && !inMemoryRateLimiter.RequestAt(tokenTotalKey, tokenTotal, duration, now) {
+			abortWithOpenAiMessage(c, http.StatusTooManyRequests, rateLimitMsg(c, i18n.MsgRateLimitTokenTotalReached, tokenTotal))
 			return
 		}
 
-		// 3. User total consume (atomic)
-		if userTotal > 0 && !inMemoryRateLimiter.Request(userTotalKey, userTotal, duration) {
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
-			return
-		}
-
-		// 4. Token total consume (atomic)
-		if tokenTotal > 0 && tokenId != "0" && !inMemoryRateLimiter.Request(tokenTotalKey, tokenTotal, duration) {
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
-			return
-		}
-
-		// 5. Process request
+		// 5. Process request. A failed response (>= 400) triggers the deferred
+		// refund above, releasing the reserved success slots.
 		c.Next()
-
-		// 6. Record success counters
-		if c.Writer.Status() < 400 {
-			if userSuccess > 0 {
-				inMemoryRateLimiter.Request(userSuccessKey, userSuccess, duration)
-			}
-			if tokenSuccess > 0 && tokenId != "0" {
-				inMemoryRateLimiter.Request(tokenSuccessKey, tokenSuccess, duration)
-			}
-		}
 	}
 }
 

@@ -200,7 +200,9 @@ twofa.code_invalid: "验证码或备用码不正确"
 
 # Rate limit messages
 rate_limit.reached: "您已达到请求数限制：{{.Minutes}}分钟内最多请求{{.Max}}次"
-rate_limit.total_reached: "您已达到总请求数限制：{{.Minutes}}分钟内最多请求{{.Max}}次，包括失败次数"
+rate_limit.total_reached: "您已达到总请求数限制：{{.Minutes}}分钟内最多请求{{.Max}}次，包括失败次数，请检查您的请求是否正确"
+rate_limit.token_reached: "该令牌的成功请求次数已达到上限：{{.Minutes}}分钟内最多请求{{.Max}}次"
+rate_limit.token_total_reached: "该令牌的请求次数已达到上限：{{.Minutes}}分钟内最多请求{{.Max}}次，包括失败次数，请检查您的请求是否正确"
 
 # Setting messages
 setting.invalid_type: "无效的预警类型"

@@ -234,8 +234,10 @@ const (
 
 // Rate limit related messages
 const (
-	MsgRateLimitReached      = "rate_limit.reached"
-	MsgRateLimitTotalReached = "rate_limit.total_reached"
+	MsgRateLimitReached          = "rate_limit.reached"           // user-aggregate success cap hit
+	MsgRateLimitTotalReached     = "rate_limit.total_reached"     // user-aggregate total cap hit
+	MsgRateLimitTokenReached     = "rate_limit.token_reached"     // per-token success cap hit
+	MsgRateLimitTokenTotalReached = "rate_limit.token_total_reached" // per-token total cap hit
 )
 
 // Setting related messages

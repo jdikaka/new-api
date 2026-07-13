@@ -199,7 +199,9 @@ twofa.code_invalid: "Verification code or backup code is incorrect"
 
 # Rate limit messages
 rate_limit.reached: "You have reached the request limit: maximum {{.Max}} requests in {{.Minutes}} minutes"
-rate_limit.total_reached: "You have reached the total request limit: maximum {{.Max}} requests in {{.Minutes}} minutes, including failed attempts"
+rate_limit.total_reached: "You have reached the total request limit: maximum {{.Max}} requests in {{.Minutes}} minutes, including failed attempts, please check that your requests are valid"
+rate_limit.token_reached: "This token has reached its request limit: maximum {{.Max}} requests in {{.Minutes}} minutes"
+rate_limit.token_total_reached: "This token has reached its total request limit: maximum {{.Max}} requests in {{.Minutes}} minutes, including failed attempts, please check that your requests are valid"
 
 # Setting messages
 setting.invalid_type: "Invalid warning type"
